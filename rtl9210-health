@@ -1,0 +1,424 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+SOURCE="$ROOT/src/rtl9210_health_probe.m"
+BINARY="$ROOT/.build/rtl9210_health_probe"
+RUNS="$ROOT/runs"
+CONFIG_PATH=${RTL9210_HEALTH_CONFIG:-"$ROOT/config/device.plist"}
+
+# Public Realtek bridge identity used only for first-time enrollment.
+ENROLL_USB_VID="0x0bda"
+ENROLL_USB_PID="0x9210"
+
+EXPECTED_MEDIA_NAME=""
+EXPECTED_SIZE=""
+EXPECTED_VOLUME_UUID=""
+EXPECTED_MOUNT=""
+EXPECTED_USB_VID=""
+EXPECTED_USB_PID=""
+EXPECTED_USB_BCD=""
+EXPECTED_USB_SERIAL=""
+EXPECTED_NVME_MODEL=""
+EXPECTED_NVME_SERIAL=""
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+plist_stdin_value() {
+    /usr/bin/plutil -extract "$2" raw -o - - <<<"$1"
+}
+
+profile_value() {
+    local key=$1
+    /usr/bin/plutil -extract "$key" raw -o - "$CONFIG_PATH" 2>/dev/null ||
+        die "device profile is missing required key: $key"
+}
+
+private_value() {
+    local file=$1 key=$2
+    /usr/bin/plutil -extract "$key" raw -o - "$file" 2>/dev/null ||
+        die "private enrollment result is incomplete"
+}
+
+validate_profile() {
+    [[ -n "$EXPECTED_MEDIA_NAME" && ${#EXPECTED_MEDIA_NAME} -le 128 ]] ||
+        die "invalid media_name in device profile"
+    [[ "$EXPECTED_SIZE" =~ ^[0-9]+$ && "$EXPECTED_SIZE" -gt 0 ]] ||
+        die "invalid physical_size_bytes in device profile"
+    [[ "$EXPECTED_VOLUME_UUID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
+        die "invalid volume_uuid in device profile"
+    [[ "$EXPECTED_MOUNT" == /Volumes/* && "$EXPECTED_MOUNT" != *$'\n'* ]] ||
+        die "invalid mount_path in device profile"
+    [[ "$EXPECTED_USB_VID" =~ ^0x[[:xdigit:]]{4}$ ]] ||
+        die "invalid usb_vid in device profile"
+    [[ "$EXPECTED_USB_PID" =~ ^0x[[:xdigit:]]{4}$ ]] ||
+        die "invalid usb_pid in device profile"
+    [[ "$EXPECTED_USB_BCD" =~ ^0x[[:xdigit:]]{4}$ ]] ||
+        die "invalid usb_bcd in device profile"
+    [[ -n "$EXPECTED_USB_SERIAL" && ${#EXPECTED_USB_SERIAL} -le 127 ]] ||
+        die "invalid usb_serial in device profile"
+    [[ -n "$EXPECTED_NVME_MODEL" && ${#EXPECTED_NVME_MODEL} -le 40 ]] ||
+        die "invalid nvme_model in device profile"
+    [[ -n "$EXPECTED_NVME_SERIAL" && ${#EXPECTED_NVME_SERIAL} -le 20 ]] ||
+        die "invalid nvme_serial in device profile"
+}
+
+load_profile() {
+    local permissions
+    [[ -f "$CONFIG_PATH" ]] ||
+        die "no enrolled device profile; run ./rtl9210-health setup"
+    [[ ! -L "$CONFIG_PATH" ]] || die "refusing a symlinked device profile"
+    permissions=$(/usr/bin/stat -f '%Lp' "$CONFIG_PATH")
+    [[ "$permissions" =~ ^[0-7]{3,4}$ ]] ||
+        die "could not validate device profile permissions"
+    (( 10#$permissions % 100 == 0 )) ||
+        die "device profile must not be readable by group or others (use chmod 600)"
+
+    EXPECTED_MEDIA_NAME=$(profile_value media_name)
+    EXPECTED_SIZE=$(profile_value physical_size_bytes)
+    EXPECTED_VOLUME_UUID=$(profile_value volume_uuid)
+    EXPECTED_MOUNT=$(profile_value mount_path)
+    EXPECTED_USB_VID=$(profile_value usb_vid)
+    EXPECTED_USB_PID=$(profile_value usb_pid)
+    EXPECTED_USB_BCD=$(profile_value usb_bcd)
+    EXPECTED_USB_SERIAL=$(profile_value usb_serial)
+    EXPECTED_NVME_MODEL=$(profile_value nvme_model)
+    EXPECTED_NVME_SERIAL=$(profile_value nvme_serial)
+    validate_profile
+}
+
+resolve_disk() {
+    local candidate info media size protocol whole
+    local matches=()
+    while read -r candidate _; do
+        [[ "$candidate" =~ ^/dev/disk[0-9]+$ ]] || continue
+        info=$(/usr/sbin/diskutil info -plist "$candidate" 2>/dev/null) || continue
+        media=$(plist_stdin_value "$info" MediaName 2>/dev/null || true)
+        size=$(plist_stdin_value "$info" IOKitSize 2>/dev/null || true)
+        protocol=$(plist_stdin_value "$info" BusProtocol 2>/dev/null || true)
+        whole=$(plist_stdin_value "$info" WholeDisk 2>/dev/null || true)
+        if [[ "$media" == "$EXPECTED_MEDIA_NAME" &&
+              "$size" == "$EXPECTED_SIZE" &&
+              "$protocol" == "USB" && "$whole" == "true" ]]; then
+            matches+=("$candidate")
+        fi
+    done < <(/usr/sbin/diskutil list external physical)
+
+    [[ ${#matches[@]} -eq 1 ]] ||
+        die "expected one enrolled RTL9210 disk; found ${#matches[@]}"
+    printf '%s\n' "${matches[0]}"
+}
+
+verify_mounted_volume() {
+    local disk=$1 info mount store disk_name
+    info=$(/usr/sbin/diskutil info -plist "$EXPECTED_VOLUME_UUID") ||
+        die "enrolled volume UUID is unavailable"
+    mount=$(plist_stdin_value "$info" MountPoint)
+    store=$(plist_stdin_value "$info" APFSPhysicalStores.0.APFSPhysicalStore)
+    disk_name=${disk#/dev/}
+    [[ "$mount" == "$EXPECTED_MOUNT" ]] ||
+        die "enrolled volume is not mounted at its configured path"
+    [[ "$store" == "$disk_name"s* ]] ||
+        die "enrolled volume is not backed by the selected physical disk"
+}
+
+time_machine_state() {
+    local output state
+    output=$(/usr/bin/tmutil status) ||
+        die "could not establish Time Machine state"
+    state=$(printf '%s\n' "$output" | /usr/bin/awk -F'= ' \
+        '/Running/{gsub(/[; ]/,"",$2); print $2; exit}')
+    case "$state" in
+        0) printf 'idle\n' ;;
+        1) printf 'running\n' ;;
+        *) die "could not establish Time Machine state" ;;
+    esac
+}
+
+require_time_machine_idle() {
+    local state
+    state=$(time_machine_state)
+    [[ "$state" == "idle" ]] ||
+        die "Time Machine is running; retry after it finishes"
+}
+
+build_if_needed() {
+    mkdir -p "$ROOT/.build"
+    if [[ ! -x "$BINARY" || "$SOURCE" -nt "$BINARY" ]]; then
+        printf 'Building native probe…\n'
+        /usr/bin/xcrun clang -fobjc-arc -Wall -Wextra -Werror \
+            -framework Foundation -framework IOKit -framework IOUSBHost \
+            "$SOURCE" -o "$BINARY"
+    fi
+}
+
+show_status() {
+    local disk info used free latest_health tm_state
+    disk=$(resolve_disk)
+    verify_mounted_volume "$disk"
+    info=$(/usr/sbin/diskutil info -plist "$EXPECTED_VOLUME_UUID")
+    used=$(plist_stdin_value "$info" CapacityInUse)
+    free=$(plist_stdin_value "$info" APFSContainerFree)
+
+    printf '\nRTL9210 Health Monitor\n'
+    printf '  Disk             %s (%s bytes)\n' "$disk" "$EXPECTED_SIZE"
+    printf '  Volume           mounted and identity-verified\n'
+    printf '  APFS used/free   %s / %s bytes\n' "$used" "$free"
+    tm_state=$(time_machine_state)
+    printf '  Time Machine     %s\n' "$tm_state"
+    if [[ -L "$ROOT/latest" ]]; then
+        latest_health=$(readlink "$ROOT/latest")
+        printf '  Latest health    %s\n' "$latest_health"
+    else
+        printf '  Latest health    none\n'
+    fi
+    printf '\n'
+}
+
+NEEDS_RESTORE=0
+ACTIVE_DISK=""
+
+restore_disk() {
+    local disk=""
+    [[ $NEEDS_RESTORE -eq 1 ]] || return 0
+    printf '\nRestoring the disk to macOS…\n' >&2
+    for _ in {1..15}; do
+        disk=$(resolve_disk 2>/dev/null || true)
+        [[ -n "$disk" ]] && break
+        sleep 1
+    done
+    if [[ -n "$disk" ]]; then
+        /usr/sbin/diskutil mountDisk "$disk" >/dev/null 2>&1 || true
+    elif [[ -n "$ACTIVE_DISK" ]]; then
+        /usr/sbin/diskutil mountDisk "$ACTIVE_DISK" >/dev/null 2>&1 || true
+    fi
+    NEEDS_RESTORE=0
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    restore_disk
+    exit "$rc"
+}
+
+hash_run() {
+    local run_dir=$1
+    (
+        cd "$run_dir"
+        : > SHA256SUMS
+        for file in identify_controller.bin smart_health_log.bin \
+                    error_info_log.bin enrollment.plist summary.txt probe.log; do
+            [[ -f "$file" ]] && /usr/bin/shasum -a 256 "$file" >> SHA256SUMS
+        done
+    )
+}
+
+LAST_RUN_DIR=""
+
+perform_capture() {
+    local mode=$1 disk=$2 run_id run_dir probe_rc verified_disk
+    /usr/bin/sudo -v
+    require_time_machine_idle
+    verified_disk=$(resolve_disk)
+    [[ "$verified_disk" == "$disk" ]] ||
+        die "the selected physical disk changed before capture"
+    verify_mounted_volume "$verified_disk"
+    run_id=$(/bin/date '+%Y%m%d_%H%M%S')
+    run_dir="$RUNS/$run_id"
+    mkdir -p "$run_dir"
+
+    ACTIVE_DISK=$disk
+    NEEDS_RESTORE=1
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+
+    printf 'Unmounting %s…\n' "$disk"
+    /usr/sbin/diskutil unmountDisk "$disk" >/dev/null ||
+        die "could not unmount the selected disk"
+    if /sbin/mount | /usr/bin/grep -Fq "on $EXPECTED_MOUNT "; then
+        die "the enrolled volume remained mounted"
+    fi
+
+    printf 'Reading controller identity and health…\n\n'
+    set +e
+    if [[ "$mode" == "enroll" ]]; then
+        # Logs are opened by the normal user; only USB access is privileged.
+        # shellcheck disable=SC2024
+        /usr/bin/sudo "$BINARY" enroll "$run_dir" \
+            "$ENROLL_USB_VID" "$ENROLL_USB_PID" \
+            > "$run_dir/summary.txt" 2> "$run_dir/probe.log"
+    else
+        # shellcheck disable=SC2024
+        /usr/bin/sudo "$BINARY" probe "$run_dir" "$CONFIG_PATH" \
+            > "$run_dir/summary.txt" 2> "$run_dir/probe.log"
+    fi
+    probe_rc=$?
+    set -e
+    /bin/cat "$run_dir/probe.log" >&2
+    /bin/cat "$run_dir/summary.txt"
+
+    restore_disk
+    trap - EXIT INT TERM HUP
+
+    /usr/bin/sudo /usr/sbin/chown -R "$UID:$(/usr/bin/id -g)" "$run_dir"
+    hash_run "$run_dir"
+    verify_mounted_volume "$(resolve_disk)"
+    [[ $probe_rc -eq 0 ]] || die "probe failed; private evidence was retained"
+    LAST_RUN_DIR=$run_dir
+}
+
+write_profile() {
+    local enrollment=$1 config_dir temp
+    local enrolled_vid enrolled_pid enrolled_bcd enrolled_usb_serial
+    local enrolled_nvme_model enrolled_nvme_serial
+
+    enrolled_vid=$(private_value "$enrollment" usb_vid)
+    enrolled_pid=$(private_value "$enrollment" usb_pid)
+    enrolled_bcd=$(private_value "$enrollment" usb_bcd)
+    enrolled_usb_serial=$(private_value "$enrollment" usb_serial)
+    enrolled_nvme_model=$(private_value "$enrollment" nvme_model)
+    enrolled_nvme_serial=$(private_value "$enrollment" nvme_serial)
+
+    config_dir=$(/usr/bin/dirname "$CONFIG_PATH")
+    mkdir -p "$config_dir"
+    temp=$(/usr/bin/mktemp "$config_dir/.device.plist.XXXXXX")
+    /usr/bin/plutil -create xml1 "$temp"
+    /usr/bin/plutil -insert media_name -string "$EXPECTED_MEDIA_NAME" "$temp"
+    /usr/bin/plutil -insert physical_size_bytes -integer "$EXPECTED_SIZE" "$temp"
+    /usr/bin/plutil -insert volume_uuid -string "$EXPECTED_VOLUME_UUID" "$temp"
+    /usr/bin/plutil -insert mount_path -string "$EXPECTED_MOUNT" "$temp"
+    /usr/bin/plutil -insert usb_vid -string "$enrolled_vid" "$temp"
+    /usr/bin/plutil -insert usb_pid -string "$enrolled_pid" "$temp"
+    /usr/bin/plutil -insert usb_bcd -string "$enrolled_bcd" "$temp"
+    /usr/bin/plutil -insert usb_serial -string "$enrolled_usb_serial" "$temp"
+    /usr/bin/plutil -insert nvme_model -string "$enrolled_nvme_model" "$temp"
+    /usr/bin/plutil -insert nvme_serial -string "$enrolled_nvme_serial" "$temp"
+    /bin/chmod 600 "$temp"
+    /bin/mv -f "$temp" "$CONFIG_PATH"
+}
+
+show_setup_candidates() {
+    local candidate info media size protocol whole
+    printf '\nConnected external physical USB disks:\n'
+    while read -r candidate _; do
+        [[ "$candidate" =~ ^/dev/disk[0-9]+$ ]] || continue
+        info=$(/usr/sbin/diskutil info -plist "$candidate" 2>/dev/null) || continue
+        protocol=$(plist_stdin_value "$info" BusProtocol 2>/dev/null || true)
+        whole=$(plist_stdin_value "$info" WholeDisk 2>/dev/null || true)
+        [[ "$protocol" == "USB" && "$whole" == "true" ]] || continue
+        media=$(plist_stdin_value "$info" MediaName 2>/dev/null || true)
+        size=$(plist_stdin_value "$info" IOKitSize 2>/dev/null || true)
+        printf '  %-12s  %-28s  %s bytes\n' "$candidate" "$media" "$size"
+    done < <(/usr/sbin/diskutil list external physical)
+    printf '\n'
+}
+
+run_setup() {
+    [[ $EUID -ne 0 ]] || die "run this front door as your normal user, not sudo"
+    require_time_machine_idle
+    [[ ! -L "$CONFIG_PATH" ]] || die "refusing a symlinked device profile"
+
+    if [[ -e "$CONFIG_PATH" ]]; then
+        read -r -p 'A local device profile exists. Type REPLACE to re-enroll: ' answer
+        [[ "$answer" == "REPLACE" ]] || die "cancelled"
+    fi
+
+    local disk volume info protocol whole media size upper_media volume_info
+    local mount volume_uuid store disk_name answer
+    show_setup_candidates
+    read -r -p 'Enter the exact RTL9210 device node shown above: ' disk
+    [[ "$disk" =~ ^/dev/disk[0-9]+$ ]] || die "invalid physical disk path"
+
+    info=$(/usr/sbin/diskutil info -plist "$disk") ||
+        die "selected disk is unavailable"
+    protocol=$(plist_stdin_value "$info" BusProtocol 2>/dev/null || true)
+    whole=$(plist_stdin_value "$info" WholeDisk 2>/dev/null || true)
+    media=$(plist_stdin_value "$info" MediaName 2>/dev/null || true)
+    size=$(plist_stdin_value "$info" IOKitSize 2>/dev/null || true)
+    upper_media=$(printf '%s' "$media" | /usr/bin/tr '[:lower:]' '[:upper:]')
+    [[ "$protocol" == "USB" && "$whole" == "true" ]] ||
+        die "selected target is not an external whole USB disk"
+    [[ "$upper_media" == *RTL9210* ]] ||
+        die "selected disk does not identify as an RTL9210"
+    [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]] ||
+        die "selected disk has an invalid size"
+
+    read -r -p 'Enter one mounted APFS volume path on that disk: ' volume
+    volume_info=$(/usr/sbin/diskutil info -plist "$volume") ||
+        die "selected volume is unavailable"
+    mount=$(plist_stdin_value "$volume_info" MountPoint 2>/dev/null || true)
+    volume_uuid=$(plist_stdin_value "$volume_info" VolumeUUID 2>/dev/null || true)
+    store=$(plist_stdin_value "$volume_info" APFSPhysicalStores.0.APFSPhysicalStore \
+        2>/dev/null || true)
+    disk_name=${disk#/dev/}
+    [[ "$mount" == "$volume" && "$mount" == /Volumes/* ]] ||
+        die "volume path is not an active /Volumes mount"
+    [[ "$volume_uuid" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] ||
+        die "selected APFS volume has no valid volume UUID"
+    [[ "$store" == "$disk_name"s* ]] ||
+        die "selected volume is not backed by the selected physical disk"
+
+    EXPECTED_MEDIA_NAME=$media
+    EXPECTED_SIZE=$size
+    EXPECTED_VOLUME_UUID=$volume_uuid
+    EXPECTED_MOUNT=$mount
+
+    printf '\nEnrollment target\n'
+    printf '  Disk    %s\n' "$disk"
+    printf '  Media   %s\n' "$media"
+    printf '  Size    %s bytes\n' "$size"
+    printf '  Volume  selected and physical-store verified\n\n'
+    printf 'Disconnect any other RTL9210 enclosure before continuing.\n'
+    read -r -p 'Type ENROLL to unmount and read this device: ' answer
+    [[ "$answer" == "ENROLL" ]] || die "cancelled"
+
+    build_if_needed
+    perform_capture enroll "$disk"
+    [[ -f "$LAST_RUN_DIR/enrollment.plist" ]] ||
+        die "probe succeeded without a private enrollment result"
+    write_profile "$LAST_RUN_DIR/enrollment.plist"
+    load_profile
+    verify_mounted_volume "$(resolve_disk)"
+    ln -sfn "runs/${LAST_RUN_DIR##*/}" "$ROOT/latest"
+
+    printf '\n✓ Enrollment and baseline health read complete\n'
+    printf '  Local profile: config/device.plist (gitignored, mode 600)\n'
+    printf '  Private run:   runs/%s\n\n' "${LAST_RUN_DIR##*/}"
+}
+
+run_probe() {
+    [[ $EUID -ne 0 ]] || die "run this front door as your normal user, not sudo"
+    require_time_machine_idle
+
+    local disk answer
+    disk=$(resolve_disk)
+    verify_mounted_volume "$disk"
+    build_if_needed
+
+    printf '\nThis will briefly unmount the enrolled volume, read three NVMe pages, and remount it.\n'
+    read -r -p 'Type PROBE to continue: ' answer
+    [[ "$answer" == "PROBE" ]] || die "cancelled"
+
+    perform_capture probe "$disk"
+    ln -sfn "runs/${LAST_RUN_DIR##*/}" "$ROOT/latest"
+    printf '\n✓ Health read complete\n  runs/%s\n\n' "${LAST_RUN_DIR##*/}"
+}
+
+usage() {
+    printf 'Usage: %s {setup|status|probe}\n' "$(basename "$0")"
+    printf '  setup   Enroll one explicitly selected RTL9210 and create a private profile.\n'
+    printf '  status  Passively verify the enrolled disk and show local health state.\n'
+    printf '  probe   Perform one guarded, read-only health capture.\n'
+}
+
+case "${1:-status}" in
+    setup) run_setup ;;
+    status) load_profile; show_status ;;
+    probe) load_profile; run_probe ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac
