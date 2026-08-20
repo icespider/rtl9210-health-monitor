@@ -54,6 +54,21 @@ cd rtl9210-health-monitor
 ./rtl9210-health setup
 ```
 
+For an automation agent that has already proved the exact targets with
+`diskutil`, use the same front door without terminal prompts:
+
+```bash
+./rtl9210-health setup \
+  --disk /dev/diskN \
+  --volume /Volumes/Name \
+  --confirm
+```
+
+If no terminal is attached, macOS displays a local administrator-password
+dialog. The bundled helper sends that password directly to `sudo`; it does not
+return the credential to the calling agent, print it or store it. Existing
+profiles still require explicit `--replace` to be overwritten.
+
 Setup is an interactive, trust-on-first-use operation. It:
 
 1. lists external physical USB disks;
@@ -89,6 +104,16 @@ send a controller command.
 The probe waits for typed `PROBE` confirmation and administrator authority. It
 then briefly unmounts the enrolled disk, reads three NVMe pages, restores the
 device and verifies that the enrolled APFS volume remounted.
+
+An automation agent can use:
+
+```bash
+./rtl9210-health probe --confirm
+```
+
+This skips only the typed confirmation. It does not skip device matching, Time
+Machine idleness, administrator authorization, unmount, transport validation,
+driver restoration or remount verification.
 
 Do **not** run `.build/rtl9210_health_probe` directly. The front door owns the
 Time Machine preflight, disk-to-volume proof, confirmation, cleanup trap and
@@ -247,6 +272,7 @@ restoration together.
 | `Time Machine is running` | Wait for it to finish. |
 | `enrolled volume UUID is unavailable` | Mount and unlock the enrolled APFS volume. |
 | `could not unmount` | Close files, shells and applications using the volume. |
+| Administrator prompt does not appear | Run from a logged-in macOS GUI session, or use the interactive command in Terminal. |
 | Build cannot find `xcrun` or SDK headers | Install Command Line Tools with `xcode-select --install`. |
 | Probe fails after unmount | The recovery trap attempts remount. Review the private `probe.log`; `latest` is unchanged. |
 | Disk does not remount | Identify it with `diskutil list external physical`, verify model and size, then mount the verified dynamic identifier. Never assume a fixed `diskN`. |
@@ -272,9 +298,12 @@ working_sequence:
   - send Realtek 0xE4 data-in commands
 teardown: destroy interface and device; rematch drivers; remount and verify APFS
 entrypoints:
-  - ./rtl9210-health setup
+  - ./rtl9210-health setup  # interactive enrollment
+  - ./rtl9210-health setup --disk /dev/diskN --volume /Volumes/Name --confirm
   - ./rtl9210-health status
-  - ./rtl9210-health probe
+  - ./rtl9210-health probe  # interactive confirmation
+  - ./rtl9210-health probe --confirm  # agent/non-interactive confirmation
+authorization: terminal sudo when interactive; local macOS dialog otherwise
 private_paths:
   - config/device.plist
   - runs/
@@ -288,6 +317,7 @@ See [AGENTS.md](AGENTS.md) for mandatory modification and verification rules.
 
 ```text
 rtl9210-health                         guarded operator front door
+scripts/macos-sudo-askpass             local GUI authorization bridge
 src/rtl9210_health_probe.m             native IOUSBHost/BOT implementation
 config/device.example.plist            public schema with placeholders
 config/device.plist                    private enrolled identity; ignored

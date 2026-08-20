@@ -11,6 +11,9 @@ the transport or operator workflow.
 - Never add data-out, firmware, format, sanitize, self-test, or namespace
   commands to this read-only project.
 - Never probe while Time Machine or another workload is active.
+- Use `status` for passive inspection. Use `probe --confirm` only after the
+  operator has authorized a fresh capture; never bypass the front door's local
+  administrator dialog.
 - Never commit `config/device.plist`, `runs/`, raw Identify Controller pages,
   hardware serials, volume UUIDs, mount labels, or absolute user paths.
 - Enrollment must require an explicitly selected external whole USB disk, a
@@ -24,8 +27,8 @@ the transport or operator workflow.
 Run the smallest complete guard set after changes:
 
 ```bash
-bash -n rtl9210-health
-shellcheck rtl9210-health
+bash -n rtl9210-health scripts/macos-sudo-askpass
+shellcheck rtl9210-health scripts/macos-sudo-askpass
 xcrun clang -fobjc-arc -Wall -Wextra -Werror \
   -framework Foundation -framework IOKit -framework IOUSBHost \
   src/rtl9210_health_probe.m -o .build/rtl9210_health_probe

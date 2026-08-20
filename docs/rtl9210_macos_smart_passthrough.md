@@ -118,7 +118,17 @@ The native probe performs this sequence:
 The shell front door separately proves the selected physical disk, its mounted
 APFS volume and Time Machine idleness before the native capture. It cleanly
 unmounts the whole disk, traps interruption and failure for remount, then proves
-that the enrolled volume returned from the expected physical store.
+that the enrolled volume returned from the expected physical store. Because an
+encrypted APFS volume can remount asynchronously after the driver is restored,
+the front door polls for up to 30 seconds and accepts success only after the
+same volume UUID, mount path and physical store all agree.
+
+Interactive runs obtain administrator authority through ordinary `sudo`.
+Non-interactive agent runs use a local hidden-input macOS dialog through the
+bundled askpass helper. Its output is connected directly to `sudo`; the calling
+agent receives neither the password nor a transcript of it. `--confirm` skips
+only the typed operator word and leaves every identity, idleness, transport and
+recovery check engaged.
 
 ## Realtek command wrapper
 
@@ -168,6 +178,11 @@ The public code cannot safely pin a device using somebody else's identifiers.
    and serial plus the NVMe model and serial.
 6. These values are stored in a mode-600, gitignored local plist.
 7. All future probes require exact matches in both the shell and native layers.
+
+For automation, the operator can supply the already verified physical disk and
+mounted volume to `setup --disk /dev/diskN --volume /Volumes/Name --confirm`.
+Routine health reads use `probe --confirm`; passive checks use `status`. These
+are modes of the same guarded front door, not alternate transport paths.
 
 The enrollment run contains a raw Identify Controller page and a private plist.
 Both are intentionally ignored. The human summary suppresses the SSD serial,

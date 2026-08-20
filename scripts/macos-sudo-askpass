@@ -1,0 +1,18 @@
+#!/bin/bash
+set -euo pipefail
+
+# sudo launches this helper with its stdout connected directly to sudo's
+# credential reader. The password is never written to a file or parent log.
+[[ -n "${SUDO_ASKPASS:-}" ]] || exit 2
+
+/usr/bin/osascript <<'APPLESCRIPT'
+set response to display dialog ¬
+    "RTL9210 Health Monitor needs administrator access for one read-only USB capture. Only authorize this after starting setup or probe yourself." ¬
+    with title "RTL9210 Health Monitor" ¬
+    default answer "" ¬
+    buttons {"Cancel", "Authorize"} ¬
+    default button "Authorize" ¬
+    cancel button "Cancel" ¬
+    with hidden answer
+return text returned of response
+APPLESCRIPT

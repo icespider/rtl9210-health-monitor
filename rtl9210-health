@@ -6,6 +6,7 @@ SOURCE="$ROOT/src/rtl9210_health_probe.m"
 BINARY="$ROOT/.build/rtl9210_health_probe"
 RUNS="$ROOT/runs"
 CONFIG_PATH=${RTL9210_HEALTH_CONFIG:-"$ROOT/config/device.plist"}
+ASKPASS="$ROOT/scripts/macos-sudo-askpass"
 
 # Public Realtek bridge identity used only for first-time enrollment.
 ENROLL_USB_VID="0x0bda"
@@ -112,17 +113,33 @@ resolve_disk() {
     printf '%s\n' "${matches[0]}"
 }
 
-verify_mounted_volume() {
+mounted_volume_matches() {
     local disk=$1 info mount store disk_name
-    info=$(/usr/sbin/diskutil info -plist "$EXPECTED_VOLUME_UUID") ||
-        die "enrolled volume UUID is unavailable"
-    mount=$(plist_stdin_value "$info" MountPoint)
-    store=$(plist_stdin_value "$info" APFSPhysicalStores.0.APFSPhysicalStore)
+    info=$(/usr/sbin/diskutil info -plist "$EXPECTED_VOLUME_UUID" 2>/dev/null) ||
+        return 1
+    mount=$(plist_stdin_value "$info" MountPoint 2>/dev/null) || return 1
+    store=$(plist_stdin_value "$info" APFSPhysicalStores.0.APFSPhysicalStore \
+        2>/dev/null) || return 1
     disk_name=${disk#/dev/}
-    [[ "$mount" == "$EXPECTED_MOUNT" ]] ||
-        die "enrolled volume is not mounted at its configured path"
-    [[ "$store" == "$disk_name"s* ]] ||
-        die "enrolled volume is not backed by the selected physical disk"
+    [[ "$mount" == "$EXPECTED_MOUNT" && "$store" == "$disk_name"s* ]]
+}
+
+verify_mounted_volume() {
+    local disk=$1
+    mounted_volume_matches "$disk" ||
+        die "enrolled volume is not mounted from the expected physical store"
+}
+
+wait_for_mounted_volume() {
+    local disk=""
+    for _ in {1..30}; do
+        disk=$(resolve_disk 2>/dev/null || true)
+        if [[ -n "$disk" ]] && mounted_volume_matches "$disk"; then
+            return 0
+        fi
+        sleep 1
+    done
+    die "enrolled volume did not return from the expected physical store"
 }
 
 time_machine_state() {
@@ -155,6 +172,30 @@ build_if_needed() {
     fi
 }
 
+USE_ASKPASS=0
+
+authorize_admin() {
+    if /usr/bin/sudo -n true >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ -t 0 && -t 1 ]]; then
+        /usr/bin/sudo -v
+        return 0
+    fi
+
+    [[ -x "$ASKPASS" ]] || die "macOS authorization helper is unavailable"
+    USE_ASKPASS=1
+    SUDO_ASKPASS="$ASKPASS" /usr/bin/sudo -A -v
+}
+
+run_as_root() {
+    if [[ $USE_ASKPASS -eq 1 ]]; then
+        SUDO_ASKPASS="$ASKPASS" /usr/bin/sudo -A "$@"
+    else
+        /usr/bin/sudo "$@"
+    fi
+}
+
 show_status() {
     local disk info used free latest_health tm_state
     disk=$(resolve_disk)
@@ -184,10 +225,15 @@ ACTIVE_DISK=""
 restore_disk() {
     local disk=""
     [[ $NEEDS_RESTORE -eq 1 ]] || return 0
+    # Clear first so an unexpected shell error cannot trigger a second reset.
+    # Post-capture identity verification remains responsible for failing the run.
+    NEEDS_RESTORE=0
     printf '\nRestoring the disk to macOS…\n' >&2
     for _ in {1..15}; do
-        disk=$(resolve_disk 2>/dev/null || true)
-        [[ -n "$disk" ]] && break
+        if disk=$(resolve_disk 2>/dev/null); then
+            break
+        fi
+        disk=""
         sleep 1
     done
     if [[ -n "$disk" ]]; then
@@ -195,7 +241,7 @@ restore_disk() {
     elif [[ -n "$ACTIVE_DISK" ]]; then
         /usr/sbin/diskutil mountDisk "$ACTIVE_DISK" >/dev/null 2>&1 || true
     fi
-    NEEDS_RESTORE=0
+    return 0
 }
 
 cleanup() {
@@ -221,7 +267,7 @@ LAST_RUN_DIR=""
 
 perform_capture() {
     local mode=$1 disk=$2 run_id run_dir probe_rc verified_disk
-    /usr/bin/sudo -v
+    authorize_admin
     require_time_machine_idle
     verified_disk=$(resolve_disk)
     [[ "$verified_disk" == "$disk" ]] ||
@@ -248,12 +294,12 @@ perform_capture() {
     if [[ "$mode" == "enroll" ]]; then
         # Logs are opened by the normal user; only USB access is privileged.
         # shellcheck disable=SC2024
-        /usr/bin/sudo "$BINARY" enroll "$run_dir" \
+        run_as_root "$BINARY" enroll "$run_dir" \
             "$ENROLL_USB_VID" "$ENROLL_USB_PID" \
             > "$run_dir/summary.txt" 2> "$run_dir/probe.log"
     else
         # shellcheck disable=SC2024
-        /usr/bin/sudo "$BINARY" probe "$run_dir" "$CONFIG_PATH" \
+        run_as_root "$BINARY" probe "$run_dir" "$CONFIG_PATH" \
             > "$run_dir/summary.txt" 2> "$run_dir/probe.log"
     fi
     probe_rc=$?
@@ -262,9 +308,10 @@ perform_capture() {
     /bin/cat "$run_dir/summary.txt"
 
     restore_disk
+    wait_for_mounted_volume
     trap - EXIT INT TERM HUP
 
-    /usr/bin/sudo /usr/sbin/chown -R "$UID:$(/usr/bin/id -g)" "$run_dir"
+    run_as_root /usr/sbin/chown -R "$UID:$(/usr/bin/id -g)" "$run_dir"
     hash_run "$run_dir"
     verify_mounted_volume "$(resolve_disk)"
     [[ $probe_rc -eq 0 ]] || die "probe failed; private evidence was retained"
@@ -318,19 +365,51 @@ show_setup_candidates() {
 }
 
 run_setup() {
+    local supplied_disk="" supplied_volume="" preconfirmed=0 replace_confirmed=0
+    local disk volume info protocol whole media size upper_media volume_info
+    local mount volume_uuid store disk_name answer
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --disk)
+                [[ $# -ge 2 ]] || die "--disk requires a value"
+                supplied_disk=$2
+                shift 2
+                ;;
+            --volume)
+                [[ $# -ge 2 ]] || die "--volume requires a value"
+                supplied_volume=$2
+                shift 2
+                ;;
+            --confirm) preconfirmed=1; shift ;;
+            --replace) replace_confirmed=1; shift ;;
+            *) die "unknown setup option: $1" ;;
+        esac
+    done
+    if [[ -n "$supplied_disk" || -n "$supplied_volume" ]]; then
+        [[ -n "$supplied_disk" && -n "$supplied_volume" ]] ||
+            die "--disk and --volume must be supplied together"
+    fi
+
     [[ $EUID -ne 0 ]] || die "run this front door as your normal user, not sudo"
     require_time_machine_idle
     [[ ! -L "$CONFIG_PATH" ]] || die "refusing a symlinked device profile"
 
     if [[ -e "$CONFIG_PATH" ]]; then
-        read -r -p 'A local device profile exists. Type REPLACE to re-enroll: ' answer
-        [[ "$answer" == "REPLACE" ]] || die "cancelled"
+        if [[ $replace_confirmed -eq 0 ]]; then
+            read -r -p 'A local device profile exists. Type REPLACE to re-enroll: ' answer
+            [[ "$answer" == "REPLACE" ]] || die "cancelled"
+        fi
     fi
 
-    local disk volume info protocol whole media size upper_media volume_info
-    local mount volume_uuid store disk_name answer
-    show_setup_candidates
-    read -r -p 'Enter the exact RTL9210 device node shown above: ' disk
+    if [[ -n "$supplied_disk" ]]; then
+        disk=$supplied_disk
+        volume=$supplied_volume
+    else
+        show_setup_candidates
+        read -r -p 'Enter the exact RTL9210 device node shown above: ' disk
+        read -r -p 'Enter one mounted APFS volume path on that disk: ' volume
+    fi
     [[ "$disk" =~ ^/dev/disk[0-9]+$ ]] || die "invalid physical disk path"
 
     info=$(/usr/sbin/diskutil info -plist "$disk") ||
@@ -347,7 +426,6 @@ run_setup() {
     [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]] ||
         die "selected disk has an invalid size"
 
-    read -r -p 'Enter one mounted APFS volume path on that disk: ' volume
     volume_info=$(/usr/sbin/diskutil info -plist "$volume") ||
         die "selected volume is unavailable"
     mount=$(plist_stdin_value "$volume_info" MountPoint 2>/dev/null || true)
@@ -373,8 +451,10 @@ run_setup() {
     printf '  Size    %s bytes\n' "$size"
     printf '  Volume  selected and physical-store verified\n\n'
     printf 'Disconnect any other RTL9210 enclosure before continuing.\n'
-    read -r -p 'Type ENROLL to unmount and read this device: ' answer
-    [[ "$answer" == "ENROLL" ]] || die "cancelled"
+    if [[ $preconfirmed -eq 0 ]]; then
+        read -r -p 'Type ENROLL to unmount and read this device: ' answer
+        [[ "$answer" == "ENROLL" ]] || die "cancelled"
+    fi
 
     build_if_needed
     perform_capture enroll "$disk"
@@ -391,6 +471,13 @@ run_setup() {
 }
 
 run_probe() {
+    local preconfirmed=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --confirm) preconfirmed=1; shift ;;
+            *) die "unknown probe option: $1" ;;
+        esac
+    done
     [[ $EUID -ne 0 ]] || die "run this front door as your normal user, not sudo"
     require_time_machine_idle
 
@@ -400,8 +487,10 @@ run_probe() {
     build_if_needed
 
     printf '\nThis will briefly unmount the enrolled volume, read three NVMe pages, and remount it.\n'
-    read -r -p 'Type PROBE to continue: ' answer
-    [[ "$answer" == "PROBE" ]] || die "cancelled"
+    if [[ $preconfirmed -eq 0 ]]; then
+        read -r -p 'Type PROBE to continue: ' answer
+        [[ "$answer" == "PROBE" ]] || die "cancelled"
+    fi
 
     perform_capture probe "$disk"
     ln -sfn "runs/${LAST_RUN_DIR##*/}" "$ROOT/latest"
@@ -413,12 +502,16 @@ usage() {
     printf '  setup   Enroll one explicitly selected RTL9210 and create a private profile.\n'
     printf '  status  Passively verify the enrolled disk and show local health state.\n'
     printf '  probe   Perform one guarded, read-only health capture.\n'
+    printf '\nAutomation:\n'
+    printf '  setup --disk /dev/diskN --volume /Volumes/Name --confirm\n'
+    printf '  probe --confirm\n'
+    printf '  Non-interactive runs use a macOS authorization dialog; credentials are not logged.\n'
 }
 
 case "${1:-status}" in
-    setup) run_setup ;;
+    setup) run_setup "${@:2}" ;;
     status) load_profile; show_status ;;
-    probe) load_profile; run_probe ;;
+    probe) load_profile; run_probe "${@:2}" ;;
     -h|--help|help) usage ;;
     *) usage >&2; exit 2 ;;
 esac

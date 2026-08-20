@@ -14,6 +14,19 @@ The human-readable summary deliberately redacts the SSD serial. Do not attach a
 raw run directory or local device profile to a public issue. Create a minimal,
 manually reviewed excerpt instead.
 
+## Administrator authorization
+
+The front door uses normal `sudo` in an interactive terminal. When an
+automation process has no terminal, it invokes `scripts/macos-sudo-askpass`,
+which presents a hidden-input AppleScript dialog in the logged-in macOS GUI.
+The helper's standard output is connected directly to `sudo`'s credential
+reader. It does not write the password to disk, print it to the calling process
+or place it in a command-line argument or environment variable.
+
+Do not replace this with automation that types, logs, shells out with or stores
+an administrator password. Cancel any authorization dialog that was not caused
+by a `setup` or `probe` operation you initiated.
+
 Before publishing a fork, scan both tracked content and Git history for:
 
 - hardware serials and volume UUIDs;
