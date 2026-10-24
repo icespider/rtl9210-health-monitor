@@ -72,4 +72,32 @@ def main(cancel_check=None):
   with patch.object(client.os,'kill',side_effect=ProcessLookupError('worker exited')):
    self.assertEqual(client.wait_status(self.run,True,1,123),125)
 
+ def client(self):
+  spec=importlib.util.spec_from_file_location('client',ROOT/'scripts/worker_client.py')
+  client=importlib.util.module_from_spec(spec);spec.loader.exec_module(client)
+  return client
+ def test_launcher_eperm_waits_for_worker_handshake(self):
+  client=self.client();events=[]
+  def publish_after_wait(seconds):
+   events.append('wait')
+   (self.run/'worker-ready.json').write_text(json.dumps({'ready':True,'worker_pid':12345}))
+  with patch.object(client.os,'kill',side_effect=PermissionError('root UID')),patch.object(client.time,'sleep',side_effect=publish_after_wait):
+   self.assertEqual(client.wait_status(self.run,True,1,123),0)
+  self.assertEqual(events,['wait'])
+ def test_launcher_eperm_without_handshake_times_out(self):
+  client=self.client()
+  with patch.object(client.os,'kill',side_effect=PermissionError('root UID')),patch.object(client.time,'sleep'),patch.object(client.time,'monotonic',side_effect=[0,0,2]):
+   self.assertEqual(client.wait_status(self.run,True,1,123),125)
+ def test_missing_launcher_fails_without_handshake(self):
+  client=self.client()
+  with patch.object(client.os,'kill',side_effect=ProcessLookupError('launcher gone')):
+   self.assertEqual(client.wait_status(self.run,True,1,123),125)
+ def test_launcher_eperm_and_completed_worker_never_ready(self):
+  client=self.client()
+  def finish(seconds):
+   (self.run/'worker-ready.json').write_text(json.dumps({'ready':True,'worker_pid':12345}))
+   (self.run/'worker-done.json').write_text(json.dumps({'quiescent':True}))
+  with patch.object(client.os,'kill',side_effect=PermissionError('root UID')),patch.object(client.time,'sleep',side_effect=finish):
+   self.assertEqual(client.wait_status(self.run,True,1,123),125)
+
 if __name__=='__main__':unittest.main(verbosity=2)

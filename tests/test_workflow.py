@@ -32,6 +32,7 @@ def plist(d): sys.stdout.buffer.write(plistlib.dumps(d))
 event(name+' '+ ' '.join(args))
 if name=='sudo':
  if scenario=='auth_fail': sys.exit(1)
+ if scenario=='launcher_eperm': time.sleep(0.5)
  assert args[0]=='-A' and '-v' not in args
  assert state()['mounted'], 'authorization requested while unmounted'
  cmd=args[1:]
@@ -144,17 +145,17 @@ elif name=='diskutil':
    n=s.get('identity_attempts',0);s['identity_attempts']=n+1;save(s)
    if n<2: sys.exit(1)
   info=dict(VolumeUUID='22222222-2222-2222-2222-222222222222' if second else '11111111-1111-1111-1111-111111111111',
-   VolumeName='Example Exchange' if second else 'Example Data',FilesystemType='exfat' if second else 'apfs',Mounted=s['mounted'])
+   VolumeName='Example Exchange' if second else 'Example Data',FilesystemType='exfat' if second else 'apfs',MountPoint='')
   if third: info.update(VolumeUUID='33333333-3333-3333-3333-333333333333',VolumeName='Example 数据',FilesystemType='exfat')
   if s['mounted']: info['MountPoint']='/Volumes/'+info['VolumeName']
   if second or third: info['ParentWholeDisk']='disk9'
   else: info['APFSPhysicalStores']=[{'APFSPhysicalStore':'disk9s2'}]
-  if scenario=='third_volume_loss' and third and s.get('restored'): info['Mounted']=False;info.pop('MountPoint',None)
+  if scenario=='third_volume_loss' and third and s.get('restored'): info['MountPoint']=''
   if scenario=='identity_mismatch' and s.get('attempted'): info['VolumeName']='REPLACED'
   if scenario=='snapshot_invalid' and second: info.pop('FilesystemType',None)
-  if s.get('late_loss') and second: info['Mounted']=False;info.pop('MountPoint',None)
-  if scenario=='snapshot_missing' and second: info['Mounted']=False;info.pop('MountPoint',None)
-  if scenario=='partial_restore' and second and s.get('restored'): info['Mounted']=False;info.pop('MountPoint',None)
+  if s.get('late_loss') and second: info['MountPoint']=''
+  if scenario=='snapshot_missing' and second: info['MountPoint']=''
+  if scenario=='partial_restore' and second and s.get('restored'): info['MountPoint']=''
   plist(info)
  else: raise AssertionError(args)
 else: raise AssertionError(name)
@@ -202,6 +203,14 @@ def mock_chown(path, uid, gid):
 """
      text=text.replace('stop = False',hook+'\nstop = False',1)
     if helper=='worker_client.py':
+     text=text.replace('os.kill(launcher, 0)', 'mock_launcher_check(launcher)')
+     text=text.replace('def wait_status(', '''def mock_launcher_check(launcher):
+    if os.environ.get('MOCK_SCENARIO') == 'launcher_eperm':
+        with (Path(os.environ['MOCK_ROOT'])/'events').open('a') as stream: stream.write('LAUNCHER_EPERM\\n')
+        raise PermissionError('simulated root-owned sudo')
+    os.kill(launcher, 0)
+
+def wait_status(''')
      text=text.replace('deadline = time.monotonic() + seconds', "deadline = time.monotonic() + (2 if os.environ.get('MOCK_SCENARIO') in ('auth_fail','worker_not_privileged') else min(seconds, 12))")
     (root/'scripts'/helper).write_text(text)
    (root/'scripts/macos-sudo-askpass').write_text('#!/bin/sh\nexit 99\n');(root/'scripts/macos-sudo-askpass').chmod(0o700)
@@ -283,6 +292,15 @@ def mock_chown(path, uid, gid):
   r=self.run_case('probe','third_volume_loss')
   self.assertEqual(r['rc'],70,json.dumps(r,indent=2))
   self.assertTrue(r['locked']);self.assertFalse(r['latest'])
+
+ def test_root_launcher_permission_denied_waits_for_handshake(self):
+  for mode in ('setup','probe'):
+   with self.subTest(mode=mode):
+    r=self.run_case(mode,'launcher_eperm')
+    self.assertEqual(r['rc'],0,json.dumps(r,indent=2))
+    self.assertIn('LAUNCHER_EPERM',r['events'])
+    self.assertLess(r['events'].index('PRIVILEGED_WORKER_STARTED'),r['events'].index('MUTATION unmountDisk'))
+    self.assertTrue(r['state']['mounted']);self.assertFalse(r['locked'])
 
  def test_setup_invalid_enrollment_preserves_profile(self):
   r=self.run_case('setup','invalid_enrollment',replace=True)

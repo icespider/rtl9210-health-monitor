@@ -13,7 +13,10 @@ The suite never invokes the production front door against a real disk. Workflow
 tests copy it into a disposable internal temporary directory, substitute every
 hardware/privilege command, and use a fake compiler/native executable. There is
 no hardware fallback. Fake `diskutil info` refuses ordinary paths, matching the
-macOS interface; fake `df` supplies the filesystem device separately. The only forwarded system parser is `plutil`, restricted
+macOS interface; fake `df` supplies the filesystem device separately. Volume
+fixtures also cover macOS responses with `MountPoint` but no `Mounted` key,
+including explicit empty mount points, missing metadata and contradictory flags.
+The only forwarded system parser is `plutil`, restricted
 to fixture files or stdin. Tests never invoke real sudo, diskutil, chown or USB
 capture. They signal only their own test processes. Fixtures use invented labels,
 serials and UUIDs; none are collected from the host.
@@ -26,6 +29,7 @@ serials and UUIDs; none are collected from the host.
   missing receipts, independent asynchronous fake disk operations, atomic profile
   publication, output backpressure and final volume loss.
 - `test_worker.py`: actual privilege prerequisite (mocked), root-owner readiness,
+  root-owned sudo launcher EPERM before readiness (never itself authorization),
   cancellation, parent disappearance and retaining ownership of a live child even
   when status publication fails.
 - `test_cancellation.py`: compiles a USB-free C harness using the production

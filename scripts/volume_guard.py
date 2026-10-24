@@ -22,6 +22,20 @@ def belongs(info, disk):
             stores[0].get('APFSPhysicalStore', '')))
     return info.get('ParentWholeDisk', info.get('PartOfWhole')) == node
 
+def is_mounted(info):
+    # macOS diskutil info may omit Mounted; MountPoint is then an explicit
+    # string (empty for an unmounted volume). Missing data is not proof of unmount.
+    point = info.get('MountPoint')
+    flag = info.get('Mounted')
+    if isinstance(point, str):
+        mounted = bool(point)
+        if 'Mounted' in info and (type(flag) is not bool or flag != mounted):
+            raise RuntimeError('Inconsistent volume mount state')
+        return mounted
+    if 'MountPoint' not in info and flag is False:
+        return False
+    raise RuntimeError('Volume mount state is unknown')
+
 def mounted_on_disk(disk, require_all_mounted=False):
     whole = query('info', '-plist', disk)
     if not whole.get('WholeDisk') or whole.get('DeviceIdentifier') != disk[5:]:
@@ -59,9 +73,9 @@ def mounted_on_disk(disk, require_all_mounted=False):
             raise RuntimeError('Target APFS volume physical-store identity is incomplete')
         if require_all_mounted and belongs(info, disk) and (
                 identifier in apfs_volumes or (info.get('FilesystemType') and info.get('Content') != 'EFI')):
-            if info.get('Mounted') is not True or not info.get('MountPoint'):
+            if not is_mounted(info):
                 raise RuntimeError('All target data volumes must be mounted and unlocked before capture')
-        if belongs(info, disk) and info.get('Mounted') and info.get('MountPoint'):
+        if belongs(info, disk) and is_mounted(info):
             if not info.get('VolumeUUID'):
                 raise RuntimeError('Mounted volume has no stable UUID')
             volumes.append({k: info.get(k, '') for k in
@@ -133,7 +147,7 @@ def main():
         verify_identity(disk, path)
         for volume in load_manifest(path):
             info = query('info', '-plist', volume['VolumeUUID'])
-            if info.get('Mounted') is not False or info.get('MountPoint'):
+            if is_mounted(info):
                 raise RuntimeError('Original volume is still mounted or mount state unknown')
         if mounted_on_disk(disk):
             raise RuntimeError('Target still has mounted volumes; refusing USB capture')

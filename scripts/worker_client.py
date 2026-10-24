@@ -33,6 +33,10 @@ def wait_status(directory, ready, seconds, launcher):
                 os.kill(launcher, 0)
             except ProcessLookupError:
                 return 125
+            except PermissionError:
+                # sudo may already be root-owned before publishing worker-ready.
+                # EPERM is not readiness: continue waiting for the worker handshake.
+                pass
         if (directory/'worker-blocked.json').exists():
             return 125
         time.sleep(0.1)

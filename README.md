@@ -31,10 +31,12 @@ Enrollment fails closed unless the selected disk identifies as RTL9210 and
 exactly one `0bda:9210` bridge is attached.
 
 This branch adds macOS 15 build compatibility and stricter capture/recovery
-supervision. These changes have **only been checked by compilation and offline
-simulation**, not by a real USB capture on macOS 15. The upstream hardware result
-above does not validate the new lifecycle. Keep this patch under review until a
-separate, explicitly authorized hardware validation is complete.
+supervision. One explicitly authorized enrollment capture has completed on
+Apple silicon and macOS 15 with an RTL9210 bridge, including normal unmount,
+identity/health/error-log reads, native release, and verified restoration of
+APFS and exFAT volumes. This is one successful hardware run, not universal
+compatibility or hardware validation of every cancellation/failure path. Those
+paths remain covered by offline simulation; keep this patch under review.
 
 ## Quick start
 

@@ -204,6 +204,32 @@ class VolumeTests(unittest.TestCase):
         volumes = copy.deepcopy(VOLUMES); volumes[1]['VolumeName'] = volumes[0]['VolumeName']
         self.assertEqual(G.validate_manifest(volumes), volumes)
 
+    def test_macos_mountpoint_without_mounted_flag(self):
+        for info in self.data.values(): info.pop('Mounted',None)
+        self.path.unlink()
+        G.snapshot('/dev/disk9',self.path,VOLUMES[0]['VolumeUUID'])
+        G.verify('/dev/disk9',self.path)
+
+    def test_macos_empty_mountpoint_proves_unmounted(self):
+        for volume in VOLUMES:
+            info=self.data[volume['VolumeUUID']]
+            info.pop('Mounted',None);info['MountPoint']=''
+        with patch.object(sys,'argv',['guard','unmounted','/dev/disk9',str(self.path)]): G.main()
+
+    def test_unknown_mount_metadata_never_proves_unmounted(self):
+        for info in ({},{'MountPoint':None},{'Mounted':True}):
+            with self.subTest(info=info),self.assertRaises(RuntimeError):G.is_mounted(info)
+
+    def test_conflicting_mount_metadata_rejected(self):
+        for info in ({'MountPoint':'/Volumes/Example','Mounted':False},
+                     {'MountPoint':'','Mounted':True},{'MountPoint':'','Mounted':0}):
+            with self.subTest(info=info),self.assertRaises(RuntimeError):G.is_mounted(info)
+
+    def test_macos_unmounted_data_volume_refused_before_capture(self):
+        info=self.data[VOLUMES[1]['VolumeUUID']]
+        info.pop('Mounted',None);info['MountPoint']=''
+        with self.assertRaises(RuntimeError):G.snapshot('/dev/disk9',self.path)
+
 class FakeChild:
     pid = 987654
     def __init__(self, running=False, stuck=False):
