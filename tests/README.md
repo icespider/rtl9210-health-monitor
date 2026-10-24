@@ -12,12 +12,14 @@ git diff --check
 The suite never invokes the production front door against a real disk. Workflow
 tests copy it into a disposable internal temporary directory, substitute every
 hardware/privilege command, and use a fake compiler/native executable. There is
-no hardware fallback. The only forwarded system parser is `plutil`, restricted
+no hardware fallback. Fake `diskutil info` refuses ordinary paths, matching the
+macOS interface; fake `df` supplies the filesystem device separately. The only forwarded system parser is `plutil`, restricted
 to fixture files or stdin. Tests never invoke real sudo, diskutil, chown or USB
 capture. They signal only their own test processes. Fixtures use invented labels,
 serials and UUIDs; none are collected from the host.
 
 - `test_simulated.py`: inventory, manifest validation, internal-storage rejection,
+  path-to-device resolution through `df -P` (including APFS Data firmlinks),
   child receipts, signal permissions, recovery deadlines and cleanup ordering.
 - `test_workflow.py`: complete setup/probe, refusal paths, delayed identities,
   authorization failure, lost sudo monitor, cancellation, ownership return,

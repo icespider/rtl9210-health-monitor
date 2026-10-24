@@ -100,6 +100,10 @@ elif name in ('native','rtl9210_health_probe'):
   (out/'release-status.plist').write_bytes(plistlib.dumps({'release_path_completed':True,'capture_acquired':True,'cancel_signal':15 if scenario=='native_cancel_cooperative' else 0}))
  print('SIMULATED HEALTH'+('x'*2000000 if scenario=='blocked_output' else ''))
  if scenario in ('native_cancel_cooperative','cancel_running_probe'): sys.exit(143)
+elif name=='df':
+ assert args[0]=='-P' and Path(args[1]).exists()
+ print('Filesystem 512-blocks Used Available Capacity Mounted on')
+ print('/dev/disk3s5 100 20 80 20% /System/Volumes/Data')
 elif name=='diskutil':
  s=state()
  if args[0] in ('unmountDisk','mountDisk'):
@@ -126,8 +130,9 @@ elif name=='diskutil':
  elif args==['apfs','list','-plist']: plist({'Containers':[{'PhysicalStores':[{'DeviceIdentifier':'disk9s2'}], 'Volumes':[{'DeviceIdentifier':'disk10s1'}]}]})
  elif args[:2]==['info','-plist']:
   target=args[2]
-  if target.startswith(str(base)) or target.startswith(('/opt/','/usr/','/Library/','/System/')):
-   plist({'Internal':scenario!='external_storage'}); sys.exit(0)
+  if target=='/dev/disk3s5':
+   plist({'Internal':scenario!='external_storage','DeviceNode':target}); sys.exit(0)
+  assert not target.startswith((str(base),'/opt/','/usr/','/Library/','/System/')), 'diskutil cannot resolve ordinary paths'
   if target in ('disk9','/dev/disk9'):
    plist(dict(WholeDisk=True,DeviceIdentifier='disk9',MediaName='RTL9210 MOCK',IOKitSize=2000000000000,BusProtocol='USB'));sys.exit(0)
   if target in ('disk9s1','disk9s2'):
@@ -163,7 +168,7 @@ class WorkflowTests(unittest.TestCase):
    root=Path(directory);(root/'scripts').mkdir();(root/'src').mkdir();(root/'fakebin').mkdir()
    (root/'profile-fixture.json').write_text(json.dumps(PROFILE))
    (root/'state.json').write_text(json.dumps({'mounted':True}))
-   for name in ('diskutil','sudo','chown','tmutil','xcrun','native','plutil','daemon'):
+   for name in ('diskutil','sudo','chown','tmutil','xcrun','native','plutil','daemon','df'):
     p=root/'fakebin'/name;p.write_text('#!'+sys.executable+'\n'+FAKE);p.chmod(0o700)
    source=(ROOT/'rtl9210-health').read_text()
    for command in ('diskutil','sudo','chown','tmutil','xcrun','plutil'):
@@ -178,7 +183,7 @@ case "${1:-status}" in''')
    (root/'rtl9210-health').write_text(source)
    (root/'src/rtl9210_health_probe.m').write_text('SIMULATED BUILD INPUT; NEVER COMPILE')
    for helper in ('storage_guard.py','volume_guard.py','bounded.py','privileged_worker.py','worker_client.py'):
-    text=(ROOT/'scripts'/helper).read_text().replace('/usr/sbin/diskutil',str(root/'fakebin/diskutil'))
+    text=(ROOT/'scripts'/helper).read_text().replace('/usr/sbin/diskutil',str(root/'fakebin/diskutil')).replace('/bin/df',str(root/'fakebin/df'))
     if helper=='bounded.py':
      # Preserve supervisor/reaping logic, shorten only fake native timeout.
      text=text.replace('deadline = time.monotonic() + float(seconds)',"deadline = time.monotonic() + (0.15 if (os.environ['MOCK_SCENARIO']=='native_timeout' and seconds=='120') or (os.environ['MOCK_SCENARIO'].startswith('async_') and seconds=='25') else float(seconds))")

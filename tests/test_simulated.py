@@ -311,13 +311,26 @@ class StorageTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(prefix='rtl-storage-mock-',dir='/private/tmp')
         self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name)
-    def run_guard(self, internal=True):
-        result=subprocess.CompletedProcess([],0,stdout=plistlib.dumps({'Internal':internal}))
-        with patch.object(sys,'argv',['storage_guard',str(self.root)]), patch('subprocess.run',return_value=result) as mocked:
+    def run_guard(self, internal=True, df_output=None, info_override=None, fail_command=None):
+        self.calls=[]
+        def fake(command, **kwargs):
+            self.calls.append(command)
+            if command[0] == fail_command:
+                raise subprocess.CalledProcessError(1, command)
+            if command[0] == '/bin/df':
+                self.assertTrue(Path(command[-1]).exists())
+                self.assertEqual(kwargs['env']['LC_ALL'], 'C')
+                output = df_output if df_output is not None else (
+                    b'Filesystem 512-blocks Used Available Capacity Mounted on\n'
+                    b'/dev/disk3s5 100 20 80 20% /System/Volumes/Data\n')
+                return subprocess.CompletedProcess(command,0,stdout=output)
+            self.assertEqual(command, ['/usr/sbin/diskutil','info','-plist','/dev/disk3s5'])
+            info = {'Internal':internal, 'DeviceNode':'/dev/disk3s5'}
+            if info_override is not None: info = info_override
+            return subprocess.CompletedProcess(command,0,stdout=plistlib.dumps(info))
+        with patch.object(sys,'argv',['storage_guard',str(self.root)]), patch('subprocess.run',side_effect=fake):
             runpy.run_path(str(ROOT/'scripts/storage_guard.py'),run_name='__main__')
-        self.assertTrue(mocked.called)
-        for call in mocked.call_args_list:
-            self.assertEqual(call.args[0][:3],['/usr/sbin/diskutil','info','-plist'])
+        self.assertTrue(self.calls)
     def test_internal_paths(self): self.run_guard()
     def test_external_root_refused(self):
         with self.assertRaises(SystemExit): self.run_guard(False)
@@ -326,6 +339,44 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(SystemExit): self.run_guard()
     def test_symlinked_helper_parent_refused(self):
         (self.root/'scripts').symlink_to(self.root)
+        with self.assertRaises(SystemExit): self.run_guard()
+
+    def test_plain_directory_with_spaces_and_unicode(self):
+        self.root=self.root/'Example 数据';self.root.mkdir()
+        self.run_guard()
+        self.assertEqual(self.calls[0][-1],str(self.root))
+
+    def test_missing_outputs_use_existing_parent(self):
+        self.run_guard()
+        self.assertFalse((self.root/'runs').exists())
+        self.assertTrue(all(Path(c[-1]).exists() for c in self.calls if c[0]=='/bin/df'))
+
+    def test_firmlink_uses_df_device_not_root_mount(self):
+        self.run_guard()
+        self.assertTrue(all(c[-1]=='/dev/disk3s5' for c in self.calls if c[0]=='/usr/sbin/diskutil'))
+
+    def test_mount_name_spaces_do_not_affect_device(self):
+        self.run_guard(df_output=b'Filesystem 512-blocks Used Available Capacity Mounted on\n/dev/disk3s5 100 20 80 20% /Volumes/Example Data\n')
+
+    def test_missing_internal_flag_rejected(self):
+        with self.assertRaises(SystemExit): self.run_guard(info_override={'DeviceNode':'/dev/disk3s5'})
+
+    def test_mismatched_device_rejected(self):
+        with self.assertRaises(SystemExit): self.run_guard(info_override={'Internal':True,'DeviceNode':'/dev/disk8s1'})
+
+    def test_malformed_df_rejected(self):
+        for output in (b'',b'header\n',b'Filesystem\n\n',b'Filesystem\n/dev/disk3s5 1\nextra\n',b'Filesystem\nserver:/share 1\n'):
+            with self.subTest(output=output), self.assertRaises(SystemExit): self.run_guard(df_output=output)
+
+    def test_df_failure_blocks_disk_query(self):
+        with self.assertRaises(subprocess.CalledProcessError): self.run_guard(fail_command='/bin/df')
+        self.assertFalse(any(c[0]=='/usr/sbin/diskutil' for c in self.calls))
+
+    def test_diskutil_failure_rejected(self):
+        with self.assertRaises(subprocess.CalledProcessError): self.run_guard(fail_command='/usr/sbin/diskutil')
+
+    def test_dangling_output_symlink_refused(self):
+        (self.root/'runs').symlink_to(self.root/'missing')
         with self.assertRaises(SystemExit): self.run_guard()
 
 # Extract ONLY these two production functions; no top-level/front-door evaluation.
